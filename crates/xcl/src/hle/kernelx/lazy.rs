@@ -16,7 +16,7 @@ use std::sync::{Once, RwLock};
 
 use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
-use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE};
 
 const PAGE: usize = 0x1_0000;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
@@ -46,13 +46,25 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    let page = r.ExceptionInformation[1] & !(PAGE - 1);
+    let at = r.ExceptionInformation[1];
+    let page = at & !(PAGE - 1);
     let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page);
     if lazy && commit(page) {
-        EXCEPTION_CONTINUE_EXECUTION
-    } else {
-        EXCEPTION_CONTINUE_SEARCH
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
+    // another thread (or `ensure`) committed the page between this fault and its handling – it
+    // left the lazy set first: a read or a write goes on (passed on, the title crashed on its
+    // first write into a fresh page)
+    if r.ExceptionInformation[0] <= 1 && read_write(at) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Whether `a` is in committed read-write memory (what `commit` makes of a lazy page).
+unsafe fn read_write(a: usize) -> bool {
+    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == MEM_COMMIT && m.Protect == PAGE_READWRITE
 }
 
 /// `page` (reserved, 64 KiB aligned) is mapped: committed on first use.
@@ -103,6 +115,43 @@ mod tests {
             ensure(r + PAGE + 4, 4);
             assert!(!LAZY.read().unwrap().contains(&(r + PAGE)));
             assert!(crate::gpu::shader::readable(r + PAGE, 4));
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Threads touching a lazy page at once all go on: one of them commits it, and the faults
+    /// of the others, handled once the page has left the lazy set, are retried rather than
+    /// passed on (a retail game's worker crashed on its first write into a fresh page).
+    #[test]
+    fn concurrent_first_touches_of_a_lazy_page_all_go_on() {
+        const THREADS: usize = 16;
+        const ROUNDS: usize = 64;
+        unsafe {
+            let r = VirtualAlloc(std::ptr::null(), ROUNDS * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            for k in 0..ROUNDS {
+                mark(r + k * PAGE);
+            }
+            let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let threads: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        for k in 0..ROUNDS {
+                            start.wait();
+                            std::ptr::write_volatile((r + k * PAGE + t * 64) as *mut u32, t as u32 + 1);
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+            for k in 0..ROUNDS {
+                for t in 0..THREADS {
+                    assert_eq!(std::ptr::read_volatile((r + k * PAGE + t * 64) as *const u32), t as u32 + 1);
+                }
+            }
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
         }
     }
