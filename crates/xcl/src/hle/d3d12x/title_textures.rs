@@ -83,9 +83,10 @@ pub fn counts() -> (usize, u64) {
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
-    // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
-    // title's bytes are not the resource's texels
-    if matches!(u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap()), 116 | 117) {
+    // the console's 32-bit 116 / 117 floats, and R9G9B9E5 targets, are half floats on the PC
+    // (`pc_resource_desc`): the title's bytes are not the resource's texels
+    let flags = u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap());
+    if matches!(u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap()), 116 | 117) || (desc[0x20..0x24] == 67u32.to_le_bytes() && flags & 5 != 0) {
         return Err("a console float format the PC holds as R16G16B16A16_FLOAT".into());
     }
     // Render targets and depth buffers are the GPU's (their metadata planes, empty planes) –
